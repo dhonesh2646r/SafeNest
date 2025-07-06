@@ -1,0 +1,2180 @@
+# =======================
+# SAFENEST NAVIGATION BACKEND - HYDERABAD FOCUSED
+# =======================
+from fastapi import FastAPI, HTTPException, BackgroundTasks, status
+from pydantic import BaseModel, Field, validator
+import osmnx as ox
+import networkx as nx
+from fastapi.middleware.cors import CORSMiddleware
+import logging
+from typing import List, Tuple, Optional, Dict
+import time
+from functools import lru_cache
+import asyncio
+from collections import deque
+import math
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+app = FastAPI(
+    title="SafeNest Hyderabad Navigation API",
+    description="Real-time route planning with safety optimization for Hyderabad area",
+    version="2.2.0",
+    docs_url="/docs",
+    redoc_url=None
+)
+
+# Enable CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Hyderabad Area Configuration
+HYDERABAD_BOUNDS = {
+    'min_lat': 17.10,
+    'max_lat': 17.60,
+    'min_lon': 78.30,
+    'max_lon': 78.70
+}
+
+# Adibatla Police Station Coordinates
+ADIBATLA_POLICE_STATION = (17.2160, 78.6139)
+
+# Application Configuration
+CENTER_POINT = ADIBATLA_POLICE_STATION  # Center on Adibatla
+GRAPH_RADIUS = 5000  # 5km radius around Adibatla
+MAX_DISTANCE_KM = 10  # 10 km maximum distance threshold
+CACHE_SIZE = 1000  # Increased cache for Hyderabad's larger area
+UPDATE_INTERVAL = 10  # seconds
+REPLAN_THRESHOLD = 50  # meters
+SESSION_TIMEOUT = 300  # 5 minutes
+DESTINATION_REACHED_THRESHOLD = 20  # meters
+
+# In-memory storage for active navigation sessions
+active_navigations: Dict[str, Dict] = {}
+
+class RouteRequest(BaseModel):
+    current_lat: float = Field(..., ge=-90, le=90, description="Current latitude")
+    current_lon: float = Field(..., ge=-180, le=180, description="Current longitude")
+    dest_lat: float = Field(
+        default=ADIBATLA_POLICE_STATION[0],
+        description="Adibatla Police Station latitude by default"
+    )
+    dest_lon: float = Field(
+        default=ADIBATLA_POLICE_STATION[1],
+        description="Adibatla Police Station longitude by default"
+    )
+    optimize_for: str = Field(
+        "shortest", 
+        description="Optimization criteria: shortest, safest, quietest, fastest"
+    )
+    session_id: Optional[str] = Field(
+        None, 
+        description="Existing session ID for continuation"
+    )
+
+    @validator('optimize_for')
+    def validate_optimize_for(cls, v):
+        if v not in ["shortest", "safest", "quietest", "fastest"]:
+            raise ValueError("Invalid optimization criteria")
+        return v
+
+class RouteResponse(BaseModel):
+    route: List[Tuple[float, float]] = Field(..., description="List of (lat, lng) coordinates")
+    waypoints: List[Tuple[float, float]] = Field(..., description="Simplified route points")
+    distance: float = Field(..., description="Total distance in meters")
+    estimated_time: float = Field(..., description="Estimated time in minutes")
+    next_check_in: float = Field(..., description="Seconds until next update")
+    session_id: str = Field(..., description="Navigation session ID")
+    message: Optional[str] = Field(None, description="Additional information")
+
+class PositionUpdate(BaseModel):
+    current_lat: float = Field(..., ge=-90, le=90)
+    current_lon: float = Field(..., ge=-180, le=180)
+    session_id: str = Field(..., description="Active session ID")
+
+class DestinationUpdate(BaseModel):
+    new_dest_lat: float = Field(..., ge=-90, le=90, description="New destination latitude")
+    new_dest_lon: float = Field(..., ge=-180, le=180, description="New destination longitude")
+    session_id: str = Field(..., description="Active session ID")
+
+class NavigationSession(BaseModel):
+    destination: Tuple[float, float]
+    current_route: List[int]
+    current_coords: List[Tuple[float, float]]
+    optimize_for: str
+    last_update: float
+    path_history: deque
+
+@app.on_event("startup")
+async def load_graph():
+    """Load and prepare the OSM graph for Hyderabad area"""
+    max_retries = 3
+    retry_delay = 5
+    
+    for attempt in range(max_retries):
+        try:
+            logger.info(f"Loading Hyderabad OSM graph (attempt {attempt + 1}/{max_retries})...")
+            start_time = time.time()
+
+            global G
+            G = ox.graph_from_point(
+                CENTER_POINT,
+                dist=GRAPH_RADIUS,
+                network_type='walk',
+                simplify=True,
+                retain_all=False,
+                truncate_by_edge=True
+            )
+
+            # Add edge attributes
+            G = ox.add_edge_speeds(G, fallback=4.5)  # 4.5 km/h walking speed
+            G = ox.add_edge_travel_times(G)
+
+            # Calculate safety and quietness scores with Hyderabad-specific adjustments
+            for u, v, k, data in G.edges(keys=True, data=True):
+                data['safety_score'] = calculate_safety_score(u, v, data)
+                data['quietness_score'] = calculate_quietness_score(u, v, data)
+
+            # Validate graph size
+            if len(G.nodes) < 10:
+                raise RuntimeError("Loaded graph is too small - may indicate download issues")
+
+            logger.info(
+                f"Hyderabad graph loaded successfully in {time.time() - start_time:.2f}s. "
+                f"Nodes: {len(G.nodes)}, Edges: {len(G.edges)}"
+            )
+            return
+            
+        except Exception as e:
+            logger.error(f"Attempt {attempt + 1} failed: {str(e)}")
+            if attempt < max_retries - 1:
+                await asyncio.sleep(retry_delay)
+            else:
+                logger.critical("Failed to load Hyderabad graph after maximum retries")
+                raise RuntimeError("Failed to initialize Hyderabad navigation graph")
+
+def calculate_safety_score(u, v, data):
+    """Calculate safety score for an edge (0-1 scale) with Hyderabad-specific factors"""
+    score = 0.5  # Base score
+    
+    # Highway type adjustments
+    if 'highway' in data:
+        highway_type = data['highway']
+        if highway_type in ['footway', 'path', 'pedestrian']:
+            score += 0.3  # Safer in Hyderabad
+        elif highway_type in ['residential', 'living_street']:
+            score += 0.15  # Hyderabad residential areas are relatively safe
+        elif highway_type in ['primary', 'secondary', 'tertiary']:
+            score -= 0.15  # Busy roads in Hyderabad
+        elif highway_type in ['motorway', 'trunk']:
+            score -= 0.4  # Very unsafe for pedestrians
+    
+    # Additional safety factors specific to Hyderabad
+    if 'lit' in data and data['lit'] == 'yes':
+        score += 0.2  # Well-lit areas are safer
+    if 'sidewalk' in data and data['sidewalk'] in ['both', 'left', 'right']:
+        score += 0.15  # Sidewalks improve safety
+    
+    return max(0.1, min(1.0, score))
+
+def calculate_quietness_score(u, v, data):
+    """Calculate quietness score for an edge (0-1 scale) with Hyderabad-specific factors"""
+    score = 0.5  # Base score
+    
+    if 'highway' in data:
+        highway_type = data['highway']
+        if highway_type in ['footway', 'path', 'pedestrian']:
+            score += 0.4  # Very quiet
+        elif highway_type in ['residential', 'living_street']:
+            score += 0.25  # Hyderabad residential areas
+        elif highway_type in ['primary', 'secondary']:
+            score -= 0.25  # Noisy Hyderabad roads
+        elif highway_type in ['motorway', 'trunk']:
+            score -= 0.5  # Very noisy
+    
+    return max(0.1, min(1.0, score))
+
+@lru_cache(maxsize=CACHE_SIZE)
+def find_route(orig_node: int, dest_node: int, optimize_for: str = "shortest"):
+    """Find optimal path with caching for Hyderabad area"""
+    try:
+        weight_dict = {
+            "shortest": "length",
+            "fastest": "travel_time",
+            "safest": "safety_score",
+            "quietest": "quietness_score"
+        }
+        weight = weight_dict.get(optimize_for, "length")
+
+        # Validate weight availability
+        if weight not in ["length", "travel_time"]:
+            for _, _, data in G.edges(data=True):
+                if weight not in data:
+                    logger.warning(f"Missing {weight} attribute, falling back to 'length'")
+                    weight = "length"
+                    break
+
+        return nx.shortest_path(G, orig_node, dest_node, weight=weight)
+
+    except nx.NetworkXNoPath:
+        logger.warning(f"No path found between nodes {orig_node} and {dest_node}")
+        return None
+    except Exception as e:
+        logger.error(f"Route calculation error: {str(e)}")
+        return None
+
+def calculate_route_stats(route):
+    """Calculate total distance and time for a route"""
+    total_length = 0
+    total_time = 0
+    
+    for i in range(len(route)-1):
+        edge_data = G.get_edge_data(route[i], route[i+1])[0]
+        total_length += edge_data.get('length', 0)
+        total_time += edge_data.get('travel_time', 0)
+    
+    return total_length, total_time / 60  # Convert to minutes
+
+def simplify_waypoints(coords: List[Tuple[float, float]], max_points=15) -> List[Tuple[float, float]]:
+    """Simplify route while preserving key points"""
+    if len(coords) <= max_points:
+        return coords
+    
+    # Keep every nth point plus start and end
+    step = max(1, len(coords) // max_points)
+    simplified = [coords[i] for i in range(0, len(coords), step)]
+    
+    # Ensure destination is included
+    if simplified[-1] != coords[-1]:
+        simplified.append(coords[-1])
+    
+    return simplified
+
+def haversine_distance(coord1, coord2):
+    """Calculate great-circle distance between two points in meters"""
+    lat1, lon1 = math.radians(coord1[0]), math.radians(coord1[1])
+    lat2, lon2 = math.radians(coord2[0]), math.radians(coord2[1])
+    
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
+    
+    a = math.sin(dlat/2)**2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon/2)**2
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
+    
+    return 6371000 * c  # Earth radius in meters
+
+def validate_within_hyderabad(lat: float, lon: float):
+    """Validate coordinates are within Hyderabad bounds"""
+    if not (HYDERABAD_BOUNDS['min_lat'] <= lat <= HYDERABAD_BOUNDS['max_lat'] and
+            HYDERABAD_BOUNDS['min_lon'] <= lon <= HYDERABAD_BOUNDS['max_lon']):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Location must be within Hyderabad area"
+        )
+
+def validate_distance(lat1: float, lon1: float, lat2: float, lon2: float):
+    """Validate distance between two points is within 10 km"""
+    distance = haversine_distance((lat1, lon1), (lat2, lon2))
+    if distance > MAX_DISTANCE_KM * 1000:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Distance between points cannot exceed {MAX_DISTANCE_KM} km"
+        )
+    return distance
+
+async def monitor_navigation_sessions():
+    """Background task to clean up stale sessions"""
+    while True:
+        try:
+            current_time = time.time()
+            stale_sessions = [
+                session_id for session_id, session in active_navigations.items()
+                if current_time - session['last_update'] > SESSION_TIMEOUT
+            ]
+            
+            for session_id in stale_sessions:
+                logger.info(f"Cleaning up stale session: {session_id}")
+                del active_navigations[session_id]
+                
+            await asyncio.sleep(60)  # Check every minute
+            
+        except Exception as e:
+            logger.error(f"Session monitoring error: {str(e)}")
+            await asyncio.sleep(30)
+
+@app.on_event("startup")
+async def startup_tasks():
+    """Initialize background tasks"""
+    asyncio.create_task(monitor_navigation_sessions())
+
+@app.post("/start_navigation", response_model=RouteResponse, status_code=status.HTTP_201_CREATED)
+async def start_navigation(data: RouteRequest, background_tasks: BackgroundTasks):
+    """Initialize a new navigation session within Hyderabad"""
+    try:
+        # Validate coordinates are within Hyderabad area
+        validate_within_hyderabad(data.current_lat, data.current_lon)
+        validate_within_hyderabad(data.dest_lat, data.dest_lon)
+        
+        # Validate distance threshold
+        distance_km = validate_distance(
+            data.current_lat, data.current_lon,
+            data.dest_lat, data.dest_lon
+        ) / 1000
+
+        session_id = data.session_id or f"nav_{int(time.time() * 1000)}"
+        
+        # Find nearest nodes
+        orig_node = ox.distance.nearest_nodes(G, data.current_lon, data.current_lat)
+        dest_node = ox.distance.nearest_nodes(G, data.dest_lon, data.dest_lat)
+
+        # Calculate route
+        route = find_route(orig_node, dest_node, data.optimize_for)
+        if not route:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="No valid route found within Hyderabad area"
+            )
+
+        # Prepare response data
+        coords = [(G.nodes[n]['y'], G.nodes[n]['x']) for n in route]
+        distance, time_est = calculate_route_stats(route)
+        waypoints = simplify_waypoints(coords)
+
+        # Store session
+        active_navigations[session_id] = {
+            'destination': (data.dest_lat, data.dest_lon),
+            'current_route': route,
+            'current_coords': coords,
+            'optimize_for': data.optimize_for,
+            'last_update': time.time(),
+            'path_history': deque(maxlen=10)
+        }
+
+        return {
+            "route": coords,
+            "waypoints": waypoints,
+            "distance": distance,
+            "estimated_time": time_est,
+            "next_check_in": UPDATE_INTERVAL,
+            "session_id": session_id,
+            "message": f"Hyderabad navigation started ({distance_km:.1f} km). Next update in {UPDATE_INTERVAL} seconds."
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Navigation start failed: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to start navigation in Hyderabad"
+        )
+
+@app.post("/update_position", response_model=RouteResponse)
+async def update_position(data: PositionUpdate):
+    """Update user position and get adjusted route within Hyderabad"""
+    try:
+        if data.session_id not in active_navigations:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Navigation session not found"
+            )
+
+        session = active_navigations[data.session_id]
+        session['last_update'] = time.time()
+        
+        # Check if destination reached
+        current_pos = (data.current_lat, data.current_lon)
+        dest_distance = haversine_distance(current_pos, session['destination'])
+        
+        if dest_distance <= DESTINATION_REACHED_THRESHOLD:
+            del active_navigations[data.session_id]
+            return {
+                "route": [],
+                "waypoints": [],
+                "distance": 0,
+                "estimated_time": 0,
+                "next_check_in": 0,
+                "session_id": data.session_id,
+                "message": "Destination reached in Hyderabad!"
+            }
+
+        # Validate new position is within Hyderabad and distance limit
+        validate_within_hyderabad(data.current_lat, data.current_lon)
+        validate_distance(data.current_lat, data.current_lon, *session['destination'])
+
+        # Find current node
+        current_node = ox.distance.nearest_nodes(G, data.current_lon, data.current_lat)
+        
+        # Check if we need to re-route
+        remaining_route = None
+        if current_node in session['current_route']:
+            node_index = session['current_route'].index(current_node)
+            remaining_route = session['current_route'][node_index:]
+        
+        if not remaining_route or len(remaining_route) < 2:
+            # Full re-route needed
+            logger.info(f"Re-routing for session {data.session_id} in Hyderabad")
+            dest_node = ox.distance.nearest_nodes(
+                G, 
+                session['destination'][1], 
+                session['destination'][0]
+            )
+            route = find_route(current_node, dest_node, session['optimize_for'])
+            
+            if not route:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="No valid route found after deviation in Hyderabad"
+                )
+            
+            coords = [(G.nodes[n]['y'], G.nodes[n]['x']) for n in route]
+            session['current_route'] = route
+            session['current_coords'] = coords
+        else:
+            # Continue with existing route
+            route = remaining_route
+            coords = [(G.nodes[n]['y'], G.nodes[n]['x']) for n in route]
+
+        distance, time_est = calculate_route_stats(route)
+        waypoints = simplify_waypoints(coords)
+
+        return {
+            "route": coords,
+            "waypoints": waypoints,
+            "distance": distance,
+            "estimated_time": time_est,
+            "next_check_in": UPDATE_INTERVAL,
+            "session_id": data.session_id,
+            "message": f"Position updated in Hyderabad. {distance:.0f}m remaining."
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Position update failed in Hyderabad: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to update position in Hyderabad"
+        )
+
+@app.post("/change_destination", response_model=RouteResponse)
+async def change_destination(data: DestinationUpdate):
+    """Change the destination for an active navigation session"""
+    try:
+        if data.session_id not in active_navigations:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Navigation session not found"
+            )
+
+        session = active_navigations[data.session_id]
+        
+        # Validate new destination is within Hyderabad
+        validate_within_hyderabad(data.new_dest_lat, data.new_dest_lon)
+        
+        # Get current position from session
+        if not session['current_coords']:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Current position not available"
+            )
+        
+        current_lat, current_lon = session['current_coords'][0]
+        
+        # Validate distance to new destination
+        distance_km = validate_distance(
+            current_lat, current_lon,
+            data.new_dest_lat, data.new_dest_lon
+        ) / 1000
+
+        # Update destination in session
+        session['destination'] = (data.new_dest_lat, data.new_dest_lon)
+        session['last_update'] = time.time()
+
+        # Find nearest nodes
+        current_node = ox.distance.nearest_nodes(G, current_lon, current_lat)
+        new_dest_node = ox.distance.nearest_nodes(G, data.new_dest_lon, data.new_dest_lat)
+
+        # Calculate new route
+        new_route = find_route(current_node, new_dest_node, session['optimize_for'])
+        if not new_route:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="No valid route found to new destination"
+            )
+
+        # Update session with new route
+        new_coords = [(G.nodes[n]['y'], G.nodes[n]['x']) for n in new_route]
+        distance, time_est = calculate_route_stats(new_route)
+        
+        session['current_route'] = new_route
+        session['current_coords'] = new_coords
+
+        return {
+            "route": new_coords,
+            "waypoints": simplify_waypoints(new_coords),
+            "distance": distance,
+            "estimated_time": time_est,
+            "next_check_in": UPDATE_INTERVAL,
+            "session_id": data.session_id,
+            "message": f"Destination changed. New route ({distance_km:.1f} km)"
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to change destination: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to change destination"
+        )
+
+@app.post("/end_navigation", status_code=status.HTTP_200_OK)
+async def end_navigation(session_id: str):
+    """Terminate an active navigation session"""
+    if session_id in active_navigations:
+        del active_navigations[session_id]
+        return {"status": "success", "message": "Hyderabad navigation ended"}
+    
+    raise HTTPException(
+        status_code=status.HTTP_404_NOT_FOUND,
+        detail="Session not found"
+    )
+
+@app.get("/health", status_code=status.HTTP_200_OK)
+async def health_check():
+    """Service health check"""
+    return {
+        "status": "healthy",
+        "location": "Hyderabad",
+        "center_point": ADIBATLA_POLICE_STATION,
+        "graph_stats": {
+            "nodes": len(G.nodes),
+            "edges": len(G.edges),
+            "area_covered_km2": round(math.pi * (GRAPH_RADIUS/1000)**2, 2)
+        },
+        "sessions": len(active_navigations),
+        "uptime": time.time() - app.startup_time
+    }
+
+# Store startup time for uptime calculation
+app.startup_time = time.time()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <title>SafeNest Hyderabad - Route Tracker</title>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="Real-time route tracking with safety features in Hyderabad">
+
+  <!-- Leaflet CSS/JS -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+  <!-- Leaflet Plugins -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet-control-geocoder/dist/Control.Geocoder.css" />
+  <script src="https://unpkg.com/leaflet-control-geocoder/dist/Control.Geocoder.js"></script>
+
+  <style>
+    :root {
+      --primary-color: #4a6fa5;
+      --safe-color: #4CAF50;
+      --warning-color: #FFC107;
+      --danger-color: #F44336;
+    }
+    
+    body {
+      margin: 0;
+      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+    }
+    
+    #map {
+      height: 100vh;
+      width: 100%;
+    }
+    
+    .control-panel {
+      position: absolute;
+      top: 20px;
+      right: 20px;
+      z-index: 1000;
+      background: rgba(255, 255, 255, 0.9);
+      padding: 15px;
+      border-radius: 8px;
+      box-shadow: 0 2px 10px rgba(0,0,0,0.2);
+      width: 300px;
+      max-width: 90%;
+    }
+    
+    .status-bar {
+      position: absolute;
+      bottom: 20px;
+      left: 50%;
+      transform: translateX(-50%);
+      background: rgba(255, 255, 255, 0.9);
+      padding: 10px 15px;
+      border-radius: 8px;
+      box-shadow: 0 2px 10px rgba(0,0,0,0.2);
+      z-index: 1000;
+      display: flex;
+      gap: 15px;
+      align-items: center;
+    }
+    
+    .status-item {
+      display: flex;
+      align-items: center;
+      gap: 5px;
+    }
+    
+    select, button {
+      padding: 8px 12px;
+      border-radius: 4px;
+      border: 1px solid #ddd;
+      width: 100%;
+      margin-bottom: 10px;
+    }
+    
+    button {
+      background-color: var(--primary-color);
+      color: white;
+      border: none;
+      cursor: pointer;
+      transition: background-color 0.3s;
+    }
+    
+    button:hover {
+      background-color: #3a5a80;
+    }
+    
+    .sos-button {
+      background-color: var(--danger-color);
+      font-weight: bold;
+    }
+    
+    .sos-button:hover {
+      background-color: #d32f2f;
+    }
+    
+    .route-option {
+      display: flex;
+      margin-bottom: 10px;
+      align-items: center;
+    }
+    
+    .route-option input {
+      margin-right: 8px;
+    }
+    
+    .safety-marker {
+      background-color: var(--safe-color);
+      border-radius: 50%;
+      width: 12px;
+      height: 12px;
+      display: inline-block;
+      margin-right: 5px;
+    }
+    
+    .loading {
+      position: absolute;
+      top: 10px;
+      left: 50%;
+      transform: translateX(-50%);
+      background: rgba(255, 255, 255, 0.9);
+      padding: 8px 16px;
+      font-size: 14px;
+      border-radius: 6px;
+      box-shadow: 0 2px 6px rgba(0,0,0,0.2);
+      z-index: 999;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    
+    .loading-spinner {
+      border: 2px solid #f3f3f3;
+      border-top: 2px solid var(--primary-color);
+      border-radius: 50%;
+      width: 16px;
+      height: 16px;
+      animation: spin 1s linear infinite;
+    }
+    
+    /* Modal styles for destination change */
+    .modal {
+      display: none;
+      position: fixed;
+      z-index: 2000;
+      left: 0;
+      top: 0;
+      width: 100%;
+      height: 100%;
+      background-color: rgba(0,0,0,0.4);
+    }
+    
+    .modal-content {
+      background-color: #fefefe;
+      margin: 15% auto;
+      padding: 20px;
+      border-radius: 8px;
+      width: 80%;
+      max-width: 400px;
+      box-shadow: 0 4px 8px rgba(0,0,0,0.2);
+    }
+    
+    .modal-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 15px;
+    }
+    
+    .close-modal {
+      color: #aaa;
+      font-size: 28px;
+      font-weight: bold;
+      cursor: pointer;
+    }
+    
+    .close-modal:hover {
+      color: black;
+    }
+    
+    .modal-body {
+      margin-bottom: 15px;
+    }
+    
+    .modal-footer {
+      display: flex;
+      justify-content: flex-end;
+      gap: 10px;
+    }
+    
+    .modal-input {
+      width: 100%;
+      padding: 8px;
+      margin-bottom: 10px;
+      border: 1px solid #ddd;
+      border-radius: 4px;
+    }
+    
+    @keyframes spin {
+      0% { transform: rotate(0deg); }
+      100% { transform: rotate(360deg); }
+    }
+    
+    @media (max-width: 768px) {
+      .control-panel {
+        top: 10px;
+        right: 10px;
+        width: 250px;
+        padding: 10px;
+      }
+      
+      .status-bar {
+        bottom: 10px;
+        font-size: 14px;
+      }
+      
+      .modal-content {
+        margin: 30% auto;
+      }
+    }
+  </style>
+</head>
+<body>
+
+<!-- Destination Change Modal -->
+<div id="destinationModal" class="modal">
+  <div class="modal-content">
+    <div class="modal-header">
+      <h3>Change Destination</h3>
+      <span class="close-modal">&times;</span>
+    </div>
+    <div class="modal-body">
+      <input type="text" id="destinationInput" class="modal-input" placeholder="Enter address or lat,lng">
+      <div id="locationSuggestions"></div>
+      <p style="font-size: 12px; color: #666;">Example: 17.4125,78.4075 or 'Gachibowli, Hyderabad'</p>
+    </div>
+    <div class="modal-footer">
+      <button id="cancelDestination">Cancel</button>
+      <button id="confirmDestination">Update Destination</button>
+    </div>
+  </div>
+</div>
+
+<div class="control-panel">
+  <h3>SafeNest Hyderabad</h3>
+  
+  <div class="route-options">
+    <div class="route-option">
+      <input type="radio" id="shortest" name="routeType" value="shortest" checked>
+      <label for="shortest">Shortest Route</label>
+    </div>
+    <div class="route-option">
+      <input type="radio" id="safest" name="routeType" value="safest">
+      <label for="safest">Safest Route <span class="safety-marker"></span></label>
+    </div>
+    <div class="route-option">
+      <input type="radio" id="quietest" name="routeType" value="quietest">
+      <label for="quietest">Quietest Route</label>
+    </div>
+    <div class="route-option">
+      <input type="radio" id="fastest" name="routeType" value="fastest">
+      <label for="fastest">Fastest Route</label>
+    </div>
+  </div>
+  
+  <button id="updateDestination">Change Destination</button>
+  <button id="shareRoute">Share My Route</button>
+  <button class="sos-button" id="sosButton">EMERGENCY SOS</button>
+</div>
+
+<div class="loading" id="loading">
+  <div class="loading-spinner"></div>
+  <span>Initializing Hyderabad map...</span>
+</div>
+
+<div class="status-bar" id="statusBar">
+  <div class="status-item">
+    <span>📍</span>
+    <span id="currentLocation">Acquiring location...</span>
+  </div>
+  <div class="status-item">
+    <span>📏</span>
+    <span id="distance">-- m</span>
+  </div>
+  <div class="status-item">
+    <span>⏱️</span>
+    <span id="eta">-- min</span>
+  </div>
+  <div class="status-item">
+    <span>🔒</span>
+    <span id="safetyLevel">--</span>
+  </div>
+  <div class="status-item">
+    <span>🕒</span>
+    <span id="localTime">IST</span>
+  </div>
+</div>
+
+<div id="map"></div>
+
+<script>
+  // Hyderabad Configuration
+  const ADIBATLA_POLICE_STATION = { lat: 17.2160, lng: 78.6139 };
+  const DEFAULT_DESTINATION = ADIBATLA_POLICE_STATION;
+  const API_BASE_URL = "http://127.0.0.1:8000";
+  const ROUTE_API = `${API_BASE_URL}/start_navigation`;
+  const UPDATE_POSITION_API = `${API_BASE_URL}/update_position`;
+  const CHANGE_DESTINATION_API = `${API_BASE_URL}/change_destination`;
+  const END_NAVIGATION_API = `${API_BASE_URL}/end_navigation`;
+  const UPDATE_INTERVAL = 10000;  // 10 seconds
+  const MAX_ROUTE_POINTS = 1000;
+  const DESTINATION_REACHED_THRESHOLD = 20; // meters
+  const DEVIATION_THRESHOLD = 50; // meters
+  
+  // App state
+  let map;
+  let routeLayer;
+  let userMarker;
+  let destMarker;
+  let currentDestination = DEFAULT_DESTINATION;
+  let watchId = null;
+  let lastPosition = null;
+  let navigationSessionId = null;
+  let positionUpdateInterval = null;
+  let currentRouteType = "shortest";
+  let geocoder = L.Control.Geocoder.nominatim();
+  
+  // Initialize map centered on Adibatla
+  function initMap() {
+    map = L.map('map').setView([ADIBATLA_POLICE_STATION.lat, ADIBATLA_POLICE_STATION.lng], 15);
+    
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
+      maxZoom: 19
+    }).addTo(map);
+    
+    // Add geocoder control focused on Hyderabad
+    L.Control.geocoder({
+      defaultMarkGeocode: false,
+      position: 'topleft',
+      placeholder: 'Search in Hyderabad...',
+      geocoder: L.Control.Geocoder.nominatim({
+        geocodingQueryParams: {
+          bounded: 1,
+          viewbox: '78.3,17.1,78.7,17.4'
+        }
+      })
+    })
+    .on('markgeocode', function(e) {
+      setDestination(e.geocode.center.lat, e.geocode.center.lng);
+    })
+    .addTo(map);
+    
+    // Set up destination marker at Adibatla Police Station
+    updateDestinationMarker(currentDestination.lat, currentDestination.lng);
+  }
+  
+  function updateDestinationMarker(lat, lng) {
+    if (destMarker) {
+      map.removeLayer(destMarker);
+    }
+    
+    destMarker = L.marker([lat, lng], {
+      icon: L.divIcon({
+        html: '🏢',
+        className: 'destination-icon',
+        iconSize: [30, 30]
+      })
+    }).addTo(map);
+    
+    destMarker.bindPopup(`Destination: ${lat.toFixed(5)}, ${lng.toFixed(5)}`).openPopup();
+  }
+  
+  function calculateDistance(lat1, lon1, lat2, lon2) {
+    const R = 6371e3;
+    const φ1 = lat1 * Math.PI/180;
+    const φ2 = lat2 * Math.PI/180;
+    const Δφ = (lat2-lat1) * Math.PI/180;
+    const Δλ = (lon2-lon1) * Math.PI/180;
+
+    const a = Math.sin(Δφ/2) * Math.sin(Δφ/2) +
+              Math.cos(φ1) * Math.cos(φ2) *
+              Math.sin(Δλ/2) * Math.sin(Δλ/2);
+    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+
+    return R * c;
+  }
+  
+  async function setDestination(lat, lng) {
+    try {
+      showLoading("Updating destination...");
+      
+      currentDestination = { lat, lng };
+      updateDestinationMarker(lat, lng);
+      
+      if (lastPosition) {
+        await endNavigationSession();
+        await startNavigationSession(
+          lastPosition.coords.latitude, 
+          lastPosition.coords.longitude
+        );
+      }
+    } catch (error) {
+      console.error("Destination change error:", error);
+      showError("Failed to update destination");
+    } finally {
+      hideLoading();
+    }
+  }
+  
+  async function changeDestination(newLat, newLng) {
+    try {
+      if (!navigationSessionId) {
+        throw new Error("No active navigation session");
+      }
+
+      showLoading("Updating destination...");
+      
+      const response = await fetchWithTimeout(CHANGE_DESTINATION_API, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          new_dest_lat: newLat,
+          new_dest_lon: newLng,
+          session_id: navigationSessionId
+        })
+      }, 10000);
+      
+      if (!response.ok) {
+        throw new Error(`HTTP error! status: ${response.status}`);
+      }
+      
+      const data = await response.json();
+      
+      if (!data.route || data.route.length < 2) {
+        throw new Error("No valid route found to new destination");
+      }
+      
+      // Update current destination
+      currentDestination = { lat: newLat, lng: newLng };
+      updateDestinationMarker(newLat, newLng);
+      
+      // Process the new route data
+      processRouteData(data);
+      
+      return true;
+      
+    } catch (error) {
+      console.error("Destination change error:", error);
+      showError("Failed to update destination");
+      return false;
+    } finally {
+      hideLoading();
+    }
+  }
+
+  async function startNavigationSession(currentLat, currentLng) {
+    try {
+      showLoading("Calculating route in Hyderabad...");
+      
+      currentRouteType = document.querySelector('input[name="routeType"]:checked').value;
+      
+      const response = await fetchWithTimeout(ROUTE_API, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          current_lat: currentLat,
+          current_lon: currentLng,
+          dest_lat: currentDestination.lat,
+          dest_lon: currentDestination.lng,
+          optimize_for: currentRouteType
+        })
+      }, 10000);
+      
+      if (!response.ok) {
+        throw new Error(`HTTP error! status: ${response.status}`);
+      }
+      
+      const data = await response.json();
+      
+      if (!data.route || data.route.length < 2) {
+        throw new Error("No valid route found in Hyderabad area");
+      }
+      
+      navigationSessionId = data.session_id;
+      processRouteData(data);
+      startPositionUpdates();
+      
+    } catch (error) {
+      console.error("Navigation start error:", error);
+      showError("Failed to start navigation in Hyderabad");
+      throw error;
+    } finally {
+      hideLoading();
+    }
+  }
+  
+  async function updatePosition(currentLat, currentLng) {
+    if (!navigationSessionId) return;
+    
+    try {
+      const response = await fetchWithTimeout(UPDATE_POSITION_API, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          current_lat: currentLat,
+          current_lon: currentLng,
+          session_id: navigationSessionId
+        })
+      }, 8000);
+      
+      if (!response.ok) {
+        throw new Error(`HTTP error! status: ${response.status}`);
+      }
+      
+      const data = await response.json();
+      
+      if (data.message === "Destination reached!") {
+        handleDestinationReached();
+        return;
+      }
+      
+      processRouteData(data);
+      
+      // Check if user has deviated significantly from route
+      checkRouteDeviation(currentLat, currentLng, data.route);
+      
+    } catch (error) {
+      console.error("Position update error:", error);
+      if (error.message.includes("Navigation session not found")) {
+        // Session might have expired, restart navigation
+        await startNavigationSession(currentLat, currentLng);
+      }
+    }
+  }
+  
+  function checkRouteDeviation(currentLat, currentLng, routeCoords) {
+    if (!routeCoords || routeCoords.length < 2) return;
+    
+    // Find nearest point on route
+    let minDistance = Infinity;
+    routeCoords.forEach(coord => {
+      const dist = calculateDistance(currentLat, currentLng, coord[0], coord[1]);
+      if (dist < minDistance) minDistance = dist;
+    });
+    
+    if (minDistance > DEVIATION_THRESHOLD) {
+      console.log(`User deviated from route by ${minDistance.toFixed(0)}m`);
+      // In a full implementation, we might trigger a re-route here
+    }
+  }
+  
+  function processRouteData(data) {
+    if (routeLayer) {
+      map.removeLayer(routeLayer);
+    }
+    
+    const latLngs = data.route
+      .slice(0, MAX_ROUTE_POINTS)
+      .map(coord => L.latLng(coord[0], coord[1]));
+    
+    routeLayer = L.polyline(latLngs, {
+      color: getRouteColor(currentRouteType),
+      weight: 6,
+      opacity: 0.8,
+      lineJoin: 'round'
+    }).addTo(map);
+    
+    // Update UI
+    if (data.distance) {
+      document.getElementById('distance').textContent = `${data.distance.toFixed(0)} m`;
+    }
+    if (data.estimated_time) {
+      document.getElementById('eta').textContent = `${data.estimated_time.toFixed(1)} min`;
+    }
+    
+    // Update safety level indicator
+    updateSafetyIndicator(currentRouteType);
+    
+    // Adjust map view
+    const bounds = L.latLngBounds(latLngs).extend(destMarker.getLatLng());
+    map.fitBounds(bounds, { padding: [50, 50] });
+  }
+  
+  function updateSafetyIndicator(routeType) {
+    const safetyElement = document.getElementById('safetyLevel');
+    if (routeType === 'safest') {
+      safetyElement.textContent = 'High';
+      safetyElement.style.color = 'var(--safe-color)';
+    } else if (routeType === 'quietest') {
+      safetyElement.textContent = 'Medium';
+      safetyElement.style.color = 'var(--warning-color)';
+    } else {
+      safetyElement.textContent = 'Standard';
+      safetyElement.style.color = 'inherit';
+    }
+  }
+  
+  function handleDestinationReached() {
+    alert("You have reached your destination in Hyderabad!");
+    endNavigationSession();
+    updateUIForDestinationReached();
+  }
+  
+  function updateUIForDestinationReached() {
+    document.getElementById('distance').textContent = "0 m";
+    document.getElementById('eta').textContent = "0 min";
+    document.getElementById('safetyLevel').textContent = "--";
+    
+    if (routeLayer) {
+      map.removeLayer(routeLayer);
+      routeLayer = null;
+    }
+  }
+  
+  async function endNavigationSession() {
+    if (!navigationSessionId) return;
+
+    try {
+      if (positionUpdateInterval) {
+        clearInterval(positionUpdateInterval);
+        positionUpdateInterval = null;
+      }
+
+      // Notify backend with session_id as a query parameter
+      const url = `${END_NAVIGATION_API}?session_id=${encodeURIComponent(navigationSessionId)}`;
+      await fetch(url, {
+        method: "POST"
+      });
+
+    } catch (error) {
+      console.error("Error ending navigation session:", error);
+    } finally {
+      navigationSessionId = null;
+    }
+  }
+  
+  function startPositionUpdates() {
+    if (positionUpdateInterval) {
+      clearInterval(positionUpdateInterval);
+    }
+    
+    positionUpdateInterval = setInterval(() => {
+      if (lastPosition && navigationSessionId) {
+        updatePosition(
+          lastPosition.coords.latitude,
+          lastPosition.coords.longitude
+        );
+      }
+    }, UPDATE_INTERVAL);
+  }
+  
+  function getRouteColor(routeType) {
+    const colors = {
+      shortest: '#4285F4',  // Blue
+      safest: '#0F9D58',    // Green
+      quietest: '#9C27B0',  // Purple
+      fastest: '#FBBC05'    // Yellow
+    };
+    return colors[routeType] || '#4285F4';
+  }
+  
+  function updateUserMarker(lat, lng) {
+    if (!userMarker) {
+      userMarker = L.marker([lat, lng], {
+        icon: L.divIcon({
+          html: '📍',
+          className: 'user-icon',
+          iconSize: [30, 30]
+        })
+      }).addTo(map);
+      userMarker.bindPopup("Your location in Hyderabad").openPopup();
+    } else {
+      userMarker.setLatLng([lat, lng]);
+    }
+    
+    document.getElementById('currentLocation').textContent = 
+      `${lat.toFixed(5)}, ${lng.toFixed(5)}`;
+  }
+  
+  // Update IST time display
+  function updateLocalTime() {
+    const options = {
+      timeZone: 'Asia/Kolkata',
+      hour: '2-digit',
+      minute: '2-digit',
+      hour12: true
+    };
+    const timeString = new Date().toLocaleTimeString('en-IN', options);
+    document.getElementById('localTime').textContent = timeString;
+  }
+
+  function handlePosition(position) {
+    lastPosition = position;
+    const { latitude, longitude } = position.coords;
+    
+    updateUserMarker(latitude, longitude);
+    
+    if (!navigationSessionId) {
+      startNavigationSession(latitude, longitude);
+    }
+  }
+  
+  function handleGeolocationError(error) {
+    console.error("Geolocation error:", error);
+    document.getElementById('currentLocation').textContent = "Location unavailable";
+    showError("Location services disabled");
+  }
+  
+  function startTracking() {
+    if (!navigator.geolocation) {
+      alert("Geolocation is not supported by your browser");
+      return;
+    }
+    
+    if (watchId !== null) {
+      navigator.geolocation.clearWatch(watchId);
+    }
+    
+    watchId = navigator.geolocation.watchPosition(
+      handlePosition,
+      handleGeolocationError,
+      {
+        enableHighAccuracy: true,
+        maximumAge: 10000,
+        timeout: 15000
+      }
+    );
+  }
+  
+  async function fetchWithTimeout(resource, options = {}, timeout = 8000) {
+    const controller = new AbortController();
+    const id = setTimeout(() => controller.abort(), timeout);
+    
+    const response = await fetch(resource, {
+      ...options,
+      signal: controller.signal
+    });
+    
+    clearTimeout(id);
+    return response;
+  }
+  
+  function showLoading(message) {
+    const loadingElement = document.getElementById('loading');
+    loadingElement.style.display = 'flex';
+    loadingElement.querySelector('span').textContent = message;
+    loadingElement.style.backgroundColor = 'rgba(255, 255, 255, 0.9)';
+  }
+  
+  function hideLoading() {
+    document.getElementById('loading').style.display = 'none';
+  }
+  
+  function showError(message) {
+    const loadingElement = document.getElementById('loading');
+    loadingElement.style.display = 'flex';
+    loadingElement.querySelector('span').textContent = message;
+    loadingElement.style.backgroundColor = 'rgba(255, 200, 200, 0.9)';
+    
+    setTimeout(hideLoading, 3000);
+  }
+
+  function showDestinationModal() {
+    const modal = document.getElementById('destinationModal');
+    modal.style.display = "block";
+    
+    // Focus the input field
+    document.getElementById('destinationInput').focus();
+  }
+
+  function hideDestinationModal() {
+    document.getElementById('destinationModal').style.display = "none";
+    document.getElementById('destinationInput').value = "";
+    document.getElementById('locationSuggestions').innerHTML = "";
+  }
+
+  async function handleDestinationInput() {
+    const input = document.getElementById('destinationInput').value.trim();
+    
+    if (input.includes(',')) {
+        // Handle direct coordinates input
+        const coords = input.split(',').map(coord => parseFloat(coord.trim()));
+        if (coords.length === 2 && !isNaN(coords[0]) && !isNaN(coords[1])) {
+            try {
+                showLoading("Updating destination...");
+                
+                // Get current position
+                if (!lastPosition) {
+                    throw new Error("Current position not available");
+                }
+                
+                const currentLat = lastPosition.coords.latitude;
+                const currentLon = lastPosition.coords.longitude;
+                
+                // Validate new destination is within Hyderabad
+                if (!(coords[0] >= 17.10 && coords[0] <= 17.60 && coords[1] >= 78.30 && coords[1] <= 78.70)) {
+                    throw new Error("Destination must be within Hyderabad bounds");
+                }
+                
+                // Validate distance (10km max)
+                const distance = calculateDistance(currentLat, currentLon, coords[0], coords[1]);
+                if (distance > 10000) { // 10km in meters
+                    throw new Error("Destination must be within 10km of current location");
+                }
+                
+                // Call backend to change destination
+                const success = await changeDestination(coords[0], coords[1]);
+                if (success) {
+                    hideDestinationModal();
+                    // Force a position update to refresh the route
+                    if (lastPosition) {
+                        await updatePosition(lastPosition.coords.latitude, lastPosition.coords.longitude);
+                    }
+                }
+            } catch (error) {
+                console.error("Destination change error:", error);
+                showError(error.message || "Failed to update destination");
+            } finally {
+                hideLoading();
+            }
+        } else {
+            showError("Invalid coordinates format. Use 'latitude,longitude'");
+        }
+    } else {
+        // Handle address input using geocoding
+        try {
+            showLoading("Searching for location...");
+            const results = await new Promise((resolve, reject) => {
+                geocoder.geocode(input, resolve, reject);
+            });
+            
+            if (results && results.length > 0) {
+                const firstResult = results[0];
+                const success = await changeDestination(firstResult.center.lat, firstResult.center.lng);
+                if (success) {
+                    hideDestinationModal();
+                    // Force a position update to refresh the route
+                    if (lastPosition) {
+                        await updatePosition(lastPosition.coords.latitude, lastPosition.coords.longitude);
+                    }
+                }
+            } else {
+                showError("Location not found in Hyderabad");
+            }
+        } catch (error) {
+            console.error("Geocoding error:", error);
+            showError("Failed to find location");
+        } finally {
+            hideLoading();
+        }
+    }
+}
+
+  function setupEventListeners() {
+    // Route type changes
+    document.querySelectorAll('input[name="routeType"]').forEach(radio => {
+      radio.addEventListener('change', async () => {
+        if (lastPosition && navigationSessionId) {
+          try {
+            await startNavigationSession(
+              lastPosition.coords.latitude, 
+              lastPosition.coords.longitude
+            );
+          } catch (error) {
+            console.error("Failed to change route type:", error);
+          }
+        }
+      });
+    });
+    
+    // Change destination button - now opens modal
+    document.getElementById('updateDestination').addEventListener('click', showDestinationModal);
+    
+    // Modal close button
+    document.querySelector('.close-modal').addEventListener('click', hideDestinationModal);
+    
+    // Modal cancel button
+    document.getElementById('cancelDestination').addEventListener('click', hideDestinationModal);
+    
+    // Modal confirm button
+    document.getElementById('confirmDestination').addEventListener('click', async () => {
+      await handleDestinationInput();
+    });
+    
+    // Allow pressing Enter in the input field
+    document.getElementById('destinationInput').addEventListener('keypress', async (e) => {
+      if (e.key === 'Enter') {
+        await handleDestinationInput();
+      }
+    });
+    
+    // Share route button
+    document.getElementById('shareRoute').addEventListener('click', () => {
+      if (navigator.share) {
+        navigator.share({
+          title: 'My SafeNest Hyderabad Route',
+          text: `Heading to ${currentDestination.lat.toFixed(4)},${currentDestination.lng.toFixed(4)} via ${currentRouteType} route`,
+          url: window.location.href
+        }).catch(err => {
+          console.log('Error sharing:', err);
+        });
+      } else {
+        alert('Web Share API not supported in your browser');
+      }
+    });
+    
+    // SOS button
+    document.getElementById('sosButton').addEventListener('click', () => {
+      if (confirm("Are you in an emergency situation? This will alert Hyderabad emergency contacts.")) {
+        alert("SOS alert sent to emergency contacts with your location!");
+        // In a real app, you would send the alert to your backend
+      }
+    });
+  }
+
+  function init() {
+    initMap();
+    setupEventListeners();
+    startTracking();
+    
+    // Update time every minute
+    setInterval(updateLocalTime, 60000);
+    updateLocalTime();
+    
+    setTimeout(() => {
+      document.getElementById('loading').style.display = 'none';
+    }, 2000);
+  }
+  
+  document.addEventListener('DOMContentLoaded', init);
+</script>
+
+</body>
+</html>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# =======================
+# SAFENEST NAVIGATION BACKEND - HYDERABAD FOCUSED
+# =======================
+from fastapi import FastAPI, HTTPException, BackgroundTasks, status
+from pydantic import BaseModel, Field, validator
+import osmnx as ox
+import networkx as nx
+from fastapi.middleware.cors import CORSMiddleware
+import logging
+from typing import List, Tuple, Optional, Dict
+import time
+from functools import lru_cache
+import asyncio
+from collections import deque
+import math
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+app = FastAPI(
+    title="SafeNest Hyderabad Navigation API",
+    description="Real-time route planning with safety optimization for Hyderabad area",
+    version="2.2.0",
+    docs_url="/docs",
+    redoc_url=None
+)
+
+# Enable CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Hyderabad Area Configuration
+HYDERABAD_BOUNDS = {
+    'min_lat': 17.10,
+    'max_lat': 17.60,
+    'min_lon': 78.30,
+    'max_lon': 78.70
+}
+
+# Adibatla Police Station Coordinates
+ADIBATLA_POLICE_STATION = (17.2160, 78.6139)
+
+# Application Configuration
+CENTER_POINT = ADIBATLA_POLICE_STATION  # Center on Adibatla
+GRAPH_RADIUS = 5000  # 5km radius around Adibatla
+MAX_DISTANCE_KM = 10  # 10 km maximum distance threshold
+CACHE_SIZE = 1000  # Increased cache for Hyderabad's larger area
+UPDATE_INTERVAL = 10  # seconds
+REPLAN_THRESHOLD = 50  # meters
+SESSION_TIMEOUT = 300  # 5 minutes
+DESTINATION_REACHED_THRESHOLD = 20  # meters
+
+# In-memory storage for active navigation sessions
+active_navigations: Dict[str, Dict] = {}
+
+class RouteRequest(BaseModel):
+    current_lat: float = Field(..., ge=-90, le=90, description="Current latitude")
+    current_lon: float = Field(..., ge=-180, le=180, description="Current longitude")
+    dest_lat: float = Field(
+        default=ADIBATLA_POLICE_STATION[0],
+        description="Adibatla Police Station latitude by default"
+    )
+    dest_lon: float = Field(
+        default=ADIBATLA_POLICE_STATION[1],
+        description="Adibatla Police Station longitude by default"
+    )
+    optimize_for: str = Field(
+        "shortest", 
+        description="Optimization criteria: shortest, safest, quietest, fastest"
+    )
+    session_id: Optional[str] = Field(
+        None, 
+        description="Existing session ID for continuation"
+    )
+
+    @validator('optimize_for')
+    def validate_optimize_for(cls, v):
+        if v not in ["shortest", "safest", "quietest", "fastest"]:
+            raise ValueError("Invalid optimization criteria")
+        return v
+
+class RouteResponse(BaseModel):
+    route: List[Tuple[float, float]] = Field(..., description="List of (lat, lng) coordinates")
+    waypoints: List[Tuple[float, float]] = Field(..., description="Simplified route points")
+    distance: float = Field(..., description="Total distance in meters")
+    estimated_time: float = Field(..., description="Estimated time in minutes")
+    next_check_in: float = Field(..., description="Seconds until next update")
+    session_id: str = Field(..., description="Navigation session ID")
+    message: Optional[str] = Field(None, description="Additional information")
+
+class PositionUpdate(BaseModel):
+    current_lat: float = Field(..., ge=-90, le=90)
+    current_lon: float = Field(..., ge=-180, le=180)
+    session_id: str = Field(..., description="Active session ID")
+
+class DestinationUpdate(BaseModel):
+    new_dest_lat: float = Field(..., ge=-90, le=90, description="New destination latitude")
+    new_dest_lon: float = Field(..., ge=-180, le=180, description="New destination longitude")
+    session_id: str = Field(..., description="Active session ID")
+
+class NavigationSession(BaseModel):
+    destination: Tuple[float, float]
+    current_route: List[int]
+    current_coords: List[Tuple[float, float]]
+    optimize_for: str
+    last_update: float
+    path_history: deque
+
+@app.on_event("startup")
+async def load_graph():
+    """Load and prepare the OSM graph for Hyderabad area"""
+    max_retries = 3
+    retry_delay = 5
+    
+    for attempt in range(max_retries):
+        try:
+            logger.info(f"Loading Hyderabad OSM graph (attempt {attempt + 1}/{max_retries})...")
+            start_time = time.time()
+
+            global G
+            G = ox.graph_from_point(
+                CENTER_POINT,
+                dist=GRAPH_RADIUS,
+                network_type='walk',
+                simplify=True,
+                retain_all=False,
+                truncate_by_edge=True
+            )
+
+            # Add edge attributes
+            G = ox.add_edge_speeds(G, fallback=4.5)  # 4.5 km/h walking speed
+            G = ox.add_edge_travel_times(G)
+
+            # Calculate safety and quietness scores with Hyderabad-specific adjustments
+            for u, v, k, data in G.edges(keys=True, data=True):
+                data['safety_score'] = calculate_safety_score(u, v, data)
+                data['quietness_score'] = calculate_quietness_score(u, v, data)
+
+            # Validate graph size
+            if len(G.nodes) < 10:
+                raise RuntimeError("Loaded graph is too small - may indicate download issues")
+
+            logger.info(
+                f"Hyderabad graph loaded successfully in {time.time() - start_time:.2f}s. "
+                f"Nodes: {len(G.nodes)}, Edges: {len(G.edges)}"
+            )
+            return
+            
+        except Exception as e:
+            logger.error(f"Attempt {attempt + 1} failed: {str(e)}")
+            if attempt < max_retries - 1:
+                await asyncio.sleep(retry_delay)
+            else:
+                logger.critical("Failed to load Hyderabad graph after maximum retries")
+                raise RuntimeError("Failed to initialize Hyderabad navigation graph")
+
+def calculate_safety_score(u, v, data):
+    """Calculate safety score for an edge (0-1 scale) with Hyderabad-specific factors"""
+    score = 0.5  # Base score
+    
+    # Highway type adjustments
+    if 'highway' in data:
+        highway_type = data['highway']
+        if highway_type in ['footway', 'path', 'pedestrian']:
+            score += 0.3  # Safer in Hyderabad
+        elif highway_type in ['residential', 'living_street']:
+            score += 0.15  # Hyderabad residential areas are relatively safe
+        elif highway_type in ['primary', 'secondary', 'tertiary']:
+            score -= 0.15  # Busy roads in Hyderabad
+        elif highway_type in ['motorway', 'trunk']:
+            score -= 0.4  # Very unsafe for pedestrians
+    
+    # Additional safety factors specific to Hyderabad
+    if 'lit' in data and data['lit'] == 'yes':
+        score += 0.2  # Well-lit areas are safer
+    if 'sidewalk' in data and data['sidewalk'] in ['both', 'left', 'right']:
+        score += 0.15  # Sidewalks improve safety
+    
+    return max(0.1, min(1.0, score))
+
+def calculate_quietness_score(u, v, data):
+    """Calculate quietness score for an edge (0-1 scale) with Hyderabad-specific factors"""
+    score = 0.5  # Base score
+    
+    if 'highway' in data:
+        highway_type = data['highway']
+        if highway_type in ['footway', 'path', 'pedestrian']:
+            score += 0.4  # Very quiet
+        elif highway_type in ['residential', 'living_street']:
+            score += 0.25  # Hyderabad residential areas
+        elif highway_type in ['primary', 'secondary']:
+            score -= 0.25  # Noisy Hyderabad roads
+        elif highway_type in ['motorway', 'trunk']:
+            score -= 0.5  # Very noisy
+    
+    return max(0.1, min(1.0, score))
+
+@lru_cache(maxsize=CACHE_SIZE)
+def find_route(orig_node: int, dest_node: int, optimize_for: str = "shortest"):
+    """Find optimal path with caching for Hyderabad area"""
+    try:
+        weight_dict = {
+            "shortest": "length",
+            "fastest": "travel_time",
+            "safest": "safety_score",
+            "quietest": "quietness_score"
+        }
+        weight = weight_dict.get(optimize_for, "length")
+
+        # Validate weight availability
+        if weight not in ["length", "travel_time"]:
+            for _, _, data in G.edges(data=True):
+                if weight not in data:
+                    logger.warning(f"Missing {weight} attribute, falling back to 'length'")
+                    weight = "length"
+                    break
+
+        return nx.shortest_path(G, orig_node, dest_node, weight=weight)
+
+    except nx.NetworkXNoPath:
+        logger.warning(f"No path found between nodes {orig_node} and {dest_node}")
+        return None
+    except Exception as e:
+        logger.error(f"Route calculation error: {str(e)}")
+        return None
+
+def calculate_route_stats(route):
+    """Calculate total distance and time for a route"""
+    total_length = 0
+    total_time = 0
+    
+    for i in range(len(route)-1):
+        edge_data = G.get_edge_data(route[i], route[i+1])[0]
+        total_length += edge_data.get('length', 0)
+        total_time += edge_data.get('travel_time', 0)
+    
+    return total_length, total_time / 60  # Convert to minutes
+
+def simplify_waypoints(coords: List[Tuple[float, float]], max_points=15) -> List[Tuple[float, float]]:
+    """Simplify route while preserving key points"""
+    if len(coords) <= max_points:
+        return coords
+    
+    # Keep every nth point plus start and end
+    step = max(1, len(coords) // max_points)
+    simplified = [coords[i] for i in range(0, len(coords), step)]
+    
+    # Ensure destination is included
+    if simplified[-1] != coords[-1]:
+        simplified.append(coords[-1])
+    
+    return simplified
+
+def haversine_distance(coord1, coord2):
+    """Calculate great-circle distance between two points in meters"""
+    lat1, lon1 = math.radians(coord1[0]), math.radians(coord1[1])
+    lat2, lon2 = math.radians(coord2[0]), math.radians(coord2[1])
+    
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
+    
+    a = math.sin(dlat/2)**2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon/2)**2
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
+    
+    return 6371000 * c  # Earth radius in meters
+
+def validate_within_hyderabad(lat: float, lon: float):
+    """Validate coordinates are within Hyderabad bounds"""
+    if not (HYDERABAD_BOUNDS['min_lat'] <= lat <= HYDERABAD_BOUNDS['max_lat'] and
+            HYDERABAD_BOUNDS['min_lon'] <= lon <= HYDERABAD_BOUNDS['max_lon']):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Location must be within Hyderabad area"
+        )
+
+def validate_distance(lat1: float, lon1: float, lat2: float, lon2: float):
+    """Validate distance between two points is within 10 km"""
+    distance = haversine_distance((lat1, lon1), (lat2, lon2))
+    if distance > MAX_DISTANCE_KM * 1000:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Distance between points cannot exceed {MAX_DISTANCE_KM} km"
+        )
+    return distance
+
+async def monitor_navigation_sessions():
+    """Background task to clean up stale sessions"""
+    while True:
+        try:
+            current_time = time.time()
+            stale_sessions = [
+                session_id for session_id, session in active_navigations.items()
+                if current_time - session['last_update'] > SESSION_TIMEOUT
+            ]
+            
+            for session_id in stale_sessions:
+                logger.info(f"Cleaning up stale session: {session_id}")
+                del active_navigations[session_id]
+                
+            await asyncio.sleep(60)  # Check every minute
+            
+        except Exception as e:
+            logger.error(f"Session monitoring error: {str(e)}")
+            await asyncio.sleep(30)
+
+@app.on_event("startup")
+async def startup_tasks():
+    """Initialize background tasks"""
+    asyncio.create_task(monitor_navigation_sessions())
+
+@app.post("/start_navigation", response_model=RouteResponse, status_code=status.HTTP_201_CREATED)
+async def start_navigation(data: RouteRequest, background_tasks: BackgroundTasks):
+    """Initialize a new navigation session within Hyderabad"""
+    try:
+        # Validate coordinates are within Hyderabad area
+        validate_within_hyderabad(data.current_lat, data.current_lon)
+        validate_within_hyderabad(data.dest_lat, data.dest_lon)
+        
+        # Validate distance threshold
+        distance_km = validate_distance(
+            data.current_lat, data.current_lon,
+            data.dest_lat, data.dest_lon
+        ) / 1000
+
+        session_id = data.session_id or f"nav_{int(time.time() * 1000)}"
+        
+        # Find nearest nodes
+        orig_node = ox.distance.nearest_nodes(G, data.current_lon, data.current_lat)
+        dest_node = ox.distance.nearest_nodes(G, data.dest_lon, data.dest_lat)
+
+        # Calculate route
+        route = find_route(orig_node, dest_node, data.optimize_for)
+        if not route:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="No valid route found within Hyderabad area"
+            )
+
+        # Prepare response data
+        coords = [(G.nodes[n]['y'], G.nodes[n]['x']) for n in route]
+        distance, time_est = calculate_route_stats(route)
+        waypoints = simplify_waypoints(coords)
+
+        # Store session
+        active_navigations[session_id] = {
+            'destination': (data.dest_lat, data.dest_lon),
+            'current_route': route,
+            'current_coords': coords,
+            'optimize_for': data.optimize_for,
+            'last_update': time.time(),
+            'path_history': deque(maxlen=10)
+        }
+
+        return {
+            "route": coords,
+            "waypoints": waypoints,
+            "distance": distance,
+            "estimated_time": time_est,
+            "next_check_in": UPDATE_INTERVAL,
+            "session_id": session_id,
+            "message": f"Hyderabad navigation started ({distance_km:.1f} km). Next update in {UPDATE_INTERVAL} seconds."
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Navigation start failed: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to start navigation in Hyderabad"
+        )
+
+@app.post("/update_position", response_model=RouteResponse)
+async def update_position(data: PositionUpdate):
+    """Update user position and get adjusted route within Hyderabad"""
+    try:
+        if data.session_id not in active_navigations:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Navigation session not found"
+            )
+
+        session = active_navigations[data.session_id]
+        session['last_update'] = time.time()
+        
+        # Check if destination reached
+        current_pos = (data.current_lat, data.current_lon)
+        dest_distance = haversine_distance(current_pos, session['destination'])
+        
+        if dest_distance <= DESTINATION_REACHED_THRESHOLD:
+            del active_navigations[data.session_id]
+            return {
+                "route": [],
+                "waypoints": [],
+                "distance": 0,
+                "estimated_time": 0,
+                "next_check_in": 0,
+                "session_id": data.session_id,
+                "message": "Destination reached in Hyderabad!"
+            }
+
+        # Validate new position is within Hyderabad and distance limit
+        validate_within_hyderabad(data.current_lat, data.current_lon)
+        validate_distance(data.current_lat, data.current_lon, *session['destination'])
+
+        # Find current node
+        current_node = ox.distance.nearest_nodes(G, data.current_lon, data.current_lat)
+        
+        # Check if we need to re-route
+        remaining_route = None
+        if current_node in session['current_route']:
+            node_index = session['current_route'].index(current_node)
+            remaining_route = session['current_route'][node_index:]
+        
+        if not remaining_route or len(remaining_route) < 2:
+            # Full re-route needed
+            logger.info(f"Re-routing for session {data.session_id} in Hyderabad")
+            dest_node = ox.distance.nearest_nodes(
+                G, 
+                session['destination'][1], 
+                session['destination'][0]
+            )
+            route = find_route(current_node, dest_node, session['optimize_for'])
+            
+            if not route:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="No valid route found after deviation in Hyderabad"
+                )
+            
+            coords = [(G.nodes[n]['y'], G.nodes[n]['x']) for n in route]
+            session['current_route'] = route
+            session['current_coords'] = coords
+        else:
+            # Continue with existing route
+            route = remaining_route
+            coords = [(G.nodes[n]['y'], G.nodes[n]['x']) for n in route]
+
+        distance, time_est = calculate_route_stats(route)
+        waypoints = simplify_waypoints(coords)
+
+        return {
+            "route": coords,
+            "waypoints": waypoints,
+            "distance": distance,
+            "estimated_time": time_est,
+            "next_check_in": UPDATE_INTERVAL,
+            "session_id": data.session_id,
+            "message": f"Position updated in Hyderabad. {distance:.0f}m remaining."
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Position update failed in Hyderabad: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to update position in Hyderabad"
+        )
+
+@app.post("/change_destination", response_model=RouteResponse)
+async def change_destination(data: DestinationUpdate):
+    """Change the destination for an active navigation session"""
+    try:
+        if data.session_id not in active_navigations:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Navigation session not found"
+            )
+
+        session = active_navigations[data.session_id]
+        
+        # Validate new destination is within Hyderabad
+        validate_within_hyderabad(data.new_dest_lat, data.new_dest_lon)
+        
+        # Get current position from session
+        if not session['current_coords']:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Current position not available"
+            )
+        
+        current_lat, current_lon = session['current_coords'][0]
+        
+        # Validate distance to new destination
+        distance_km = validate_distance(
+            current_lat, current_lon,
+            data.new_dest_lat, data.new_dest_lon
+        ) / 1000
+
+        # Update destination in session
+        session['destination'] = (data.new_dest_lat, data.new_dest_lon)
+        session['last_update'] = time.time()
+
+        # Find nearest nodes
+        current_node = ox.distance.nearest_nodes(G, current_lon, current_lat)
+        new_dest_node = ox.distance.nearest_nodes(G, data.new_dest_lon, data.new_dest_lat)
+
+        # Calculate new route
+        new_route = find_route(current_node, new_dest_node, session['optimize_for'])
+        if not new_route:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="No valid route found to new destination"
+            )
+
+        # Update session with new route
+        new_coords = [(G.nodes[n]['y'], G.nodes[n]['x']) for n in new_route]
+        distance, time_est = calculate_route_stats(new_route)
+        
+        session['current_route'] = new_route
+        session['current_coords'] = new_coords
+
+        return {
+            "route": new_coords,
+            "waypoints": simplify_waypoints(new_coords),
+            "distance": distance,
+            "estimated_time": time_est,
+            "next_check_in": UPDATE_INTERVAL,
+            "session_id": data.session_id,
+            "message": f"Destination changed. New route ({distance_km:.1f} km)"
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to change destination: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to change destination"
+        )
+
+@app.post("/end_navigation", status_code=status.HTTP_200_OK)
+async def end_navigation(session_id: str):
+    """Terminate an active navigation session"""
+    if session_id in active_navigations:
+        del active_navigations[session_id]
+        return {"status": "success", "message": "Hyderabad navigation ended"}
+    
+    raise HTTPException(
+        status_code=status.HTTP_404_NOT_FOUND,
+        detail="Session not found"
+    )
+
+@app.get("/health", status_code=status.HTTP_200_OK)
+async def health_check():
+    """Service health check"""
+    return {
+        "status": "healthy",
+        "location": "Hyderabad",
+        "center_point": ADIBATLA_POLICE_STATION,
+        "graph_stats": {
+            "nodes": len(G.nodes),
+            "edges": len(G.edges),
+            "area_covered_km2": round(math.pi * (GRAPH_RADIUS/1000)**2, 2)
+        },
+        "sessions": len(active_navigations),
+        "uptime": time.time() - app.startup_time
+    }
+
+# Store startup time for uptime calculation
+app.startup_time = time.time()
