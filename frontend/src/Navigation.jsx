@@ -3,7 +3,6 @@ import 'leaflet/dist/leaflet.css';
 import { MapContainer, TileLayer, Polyline, Marker, Popup } from 'react-leaflet';
 import L from 'leaflet';
 
-// Fix for default marker icons in Leaflet
 import markerIcon2x from 'leaflet/dist/images/marker-icon-2x.png';
 import markerIcon from 'leaflet/dist/images/marker-icon.png';
 import markerShadow from 'leaflet/dist/images/marker-shadow.png';
@@ -21,11 +20,10 @@ L.Icon.Default.mergeOptions({
 
 const API_BASE = 'http://127.0.0.1:8000';
 
-// Updated defaults for Hyderabad (Adibatla area)
 const defaultCoords = {
-  current_lat: 17.2160,  // Adibatla latitude
-  current_lon: 78.6139,  // Adibatla longitude
-  dest_lat: 17.18985,    // Default to police station
+  current_lat: 17.2160,
+  current_lon: 78.6139,
+  dest_lat: 17.18985,
   dest_lon: 78.64838,
 };
 
@@ -376,7 +374,6 @@ function Navigation() {
     }}>
       <h2 style={{ color: '#2c3e50', marginBottom: '1rem' }}>SafeNest Hyderabad Navigation</h2>
       
-      {/* Health status */}
       <div style={{ 
         padding: '0.5rem', 
         marginBottom: '1rem',
@@ -398,7 +395,6 @@ function Navigation() {
         )}
       </div>
       
-      {/* Coordinates input */}
       <div style={{ 
         display: 'grid',
         gridTemplateColumns: '1fr 1fr',
@@ -454,7 +450,6 @@ function Navigation() {
         </div>
       </div>
       
-      {/* Optimization options */}
       <div style={{ marginBottom: '1rem' }}>
         <label style={{ display: 'block', marginBottom: '0.5rem' }}>
           <b>Optimization Criteria:</b>
@@ -470,7 +465,6 @@ function Navigation() {
         </select>
       </div>
       
-      {/* Action buttons */}
       <div style={{ 
         display: 'flex',
         gap: '0.5rem',
@@ -527,7 +521,6 @@ function Navigation() {
         </button>
       </div>
       
-      {/* Session info */}
       {sessionId && (
         <div style={{ 
           padding: '0.5rem',
@@ -544,7 +537,6 @@ function Navigation() {
         </div>
       )}
       
-      {/* Messages */}
       {message && (
         <div style={{ 
           padding: '0.5rem',
@@ -569,7 +561,6 @@ function Navigation() {
         </div>
       )}
       
-      {/* Route information */}
       {routeData && (
         <div style={{ marginBottom: '1rem' }}>
           <div style={{ 
@@ -591,7 +582,6 @@ function Navigation() {
             </div>
           </div>
           
-          {/* Map display */}
           <div style={{ marginBottom: '1rem' }}>
             <h3 style={{ marginBottom: '0.5rem' }}>Route Map</h3>
             <MapDisplay 
@@ -603,7 +593,6 @@ function Navigation() {
         </div>
       )}
       
-      {/* Change destination */}
       {sessionId && (
         <div style={{ 
           padding: '1rem',
@@ -647,7 +636,6 @@ function Navigation() {
         </div>
       )}
       
-      {/* Incident reporting */}
       {sessionId && (
         <div style={{ 
           padding: '1rem',
