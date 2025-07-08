@@ -119,6 +119,10 @@ function Navigation() {
   const [currentPosition, setCurrentPosition] = useState(null);
   const [destination, setDestination] = useState(null);
   const [showReportForm, setShowReportForm] = useState(false);
+  const [showLocationExtractor, setShowLocationExtractor] = useState(false);
+  const [locationText, setLocationText] = useState('');
+  const [extractedLocation, setExtractedLocation] = useState(null);
+  const [aiAnalysis, setAiAnalysis] = useState(null);
   const [incidentData, setIncidentData] = useState({
     incident_type: 'harassment',
     severity: 'medium',
@@ -144,6 +148,84 @@ function Navigation() {
     const interval = setInterval(checkHealth, 30000);
     return () => clearInterval(interval);
   }, []);
+
+  const extractLocation = async () => {
+    if (!locationText.trim()) {
+      setError('Please enter a location description');
+      return;
+    }
+
+    setLoading(true);
+    setError('');
+    setMessage('');
+
+    try {
+      const res = await fetch(`${API_BASE}/extract_location`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          location_text: locationText,
+          context: "Hyderabad, India area"
+        }),
+      });
+
+      if (!res.ok) {
+        const errorData = await res.json();
+        throw new Error(errorData.detail || 'Failed to extract location');
+      }
+
+      const data = await res.json();
+      setExtractedLocation(data);
+      setMessage(`Location extracted: ${data.location_name} (Confidence: ${(data.confidence * 100).toFixed(1)}%)`);
+      
+      setCoords(prev => ({
+        ...prev,
+        dest_lat: data.coordinates[0],
+        dest_lon: data.coordinates[1]
+      }));
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const analyzeIncident = async (description) => {
+    if (!description.trim()) return;
+
+    setLoading(true);
+    setError('');
+
+    try {
+      const res = await fetch(`${API_BASE}/analyze_incident`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          incident_description: description,
+          location_context: `Location: ${coords.current_lat}, ${coords.current_lon}`,
+          time_context: new Date().toISOString()
+        }),
+      });
+
+      if (!res.ok) {
+        const errorData = await res.json();
+        throw new Error(errorData.detail || 'Failed to analyze incident');
+      }
+
+      const data = await res.json();
+      setAiAnalysis(data);
+      setIncidentData(prev => ({
+        ...prev,
+        incident_type: data.incident_type,
+        severity: data.severity_level,
+        description: data.formatted_description
+      }));
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setLoading(false);
+    }
+  };
 
   const startNavigation = async () => {
     setLoading(true);
@@ -314,6 +396,10 @@ function Navigation() {
   const handleIncidentInput = e => {
     const { name, value } = e.target;
     setIncidentData(prev => ({ ...prev, [name]: value }));
+    
+    if (name === 'description' && value.length > 10) {
+      analyzeIncident(value);
+    }
   };
 
   const submitIncidentReport = async () => {
@@ -348,6 +434,7 @@ function Navigation() {
       const data = await res.json();
       setMessage(data.message || 'Incident reported successfully');
       setShowReportForm(false);
+      setAiAnalysis(data.ai_analysis);
       setIncidentData({
         incident_type: 'harassment',
         severity: 'medium',
@@ -386,7 +473,8 @@ function Navigation() {
             <b> Location:</b> {health.location} | 
             <b> Active Sessions:</b> {health.sessions} | 
             <b> Graph Nodes:</b> {health.graph_stats.nodes} | 
-            <b> Uptime:</b> {Math.round(health.uptime)} seconds
+            <b> Uptime:</b> {Math.round(health.uptime)} seconds |
+            <b> AI Enabled:</b> {health.ai_enabled ? 'Yes' : 'No'}
           </div>
         ) : (
           <div style={{ fontSize: 14, color: '#c62828' }}>
@@ -520,6 +608,80 @@ function Navigation() {
           End Navigation
         </button>
       </div>
+      
+      <div style={{ 
+        display: 'flex',
+        gap: '0.5rem',
+        marginBottom: '1rem'
+      }}>
+        <button 
+          onClick={() => setShowLocationExtractor(!showLocationExtractor)}
+          style={{
+            flex: 1,
+            padding: '0.5rem',
+            backgroundColor: '#9c27b0',
+            color: 'white',
+            border: 'none',
+            borderRadius: 4,
+            cursor: 'pointer'
+          }}
+        >
+          {showLocationExtractor ? 'Hide' : 'Show'} AI Location Extractor
+        </button>
+      </div>
+      
+      {showLocationExtractor && (
+        <div style={{ 
+          padding: '1rem',
+          border: '1px solid #e0e0e0',
+          borderRadius: 4,
+          marginBottom: '1rem',
+          backgroundColor: '#f8f9fa'
+        }}>
+          <h3 style={{ marginBottom: '0.5rem' }}>AI Location Extractor</h3>
+          <p style={{ fontSize: '14px', color: '#666', marginBottom: '1rem' }}>
+            Describe a location in Hyderabad and AI will extract coordinates
+          </p>
+          
+          <div style={{ marginBottom: '1rem' }}>
+            <textarea
+              value={locationText}
+              onChange={e => setLocationText(e.target.value)}
+              placeholder="e.g., 'near Adibatla Police Station' or 'Cyberabad area near HITEC City'"
+              style={{ width: '100%', padding: '0.5rem', minHeight: '80px' }}
+            />
+          </div>
+          
+          <button 
+            onClick={extractLocation}
+            disabled={loading || !locationText.trim()}
+            style={{
+              padding: '0.5rem 1rem',
+              backgroundColor: '#ff9800',
+              color: 'white',
+              border: 'none',
+              borderRadius: 4,
+              cursor: 'pointer'
+            }}
+          >
+            {loading ? 'Extracting...' : 'Extract Location'}
+          </button>
+          
+          {extractedLocation && (
+            <div style={{ 
+              marginTop: '1rem',
+              padding: '0.5rem',
+              backgroundColor: '#e8f5e9',
+              borderRadius: 4
+            }}>
+              <div><b>Location:</b> {extractedLocation.location_name}</div>
+              <div><b>Address:</b> {extractedLocation.address}</div>
+              <div><b>Coordinates:</b> {extractedLocation.coordinates[0].toFixed(6)}, {extractedLocation.coordinates[1].toFixed(6)}</div>
+              <div><b>Confidence:</b> {(extractedLocation.confidence * 100).toFixed(1)}%</div>
+            </div>
+          )}
+        </div>
+      )}
       
       {sessionId && (
         <div style={{ 
@@ -695,10 +857,35 @@ function Navigation() {
                   name="description"
                   value={incidentData.description}
                   onChange={handleIncidentInput}
-                  placeholder="Describe the incident in detail"
+                  placeholder="Describe the incident in detail (AI will analyze and format automatically)"
                   style={{ width: '100%', padding: '0.5rem', minHeight: '80px' }}
                 />
               </div>
+              
+              {aiAnalysis && (
+                <div style={{ 
+                  marginBottom: '0.5rem',
+                  padding: '0.5rem',
+                  backgroundColor: '#e3f2fd',
+                  borderRadius: 4
+                }}>
+                  <div><b>AI Analysis:</b></div>
+                  <div>Severity: {aiAnalysis.severity_level}</div>
+                  <div>Type: {aiAnalysis.incident_type}</div>
+                  <div>Risk Score: {(aiAnalysis.risk_score * 100).toFixed(1)}%</div>
+                  <div>Weight Factor: {(aiAnalysis.weight_factor * 100).toFixed(1)}%</div>
+                  {aiAnalysis.recommendations.length > 0 && (
+                    <div>
+                      <b>Recommendations:</b>
+                      <ul style={{ margin: '0.25rem 0', paddingLeft: '1rem' }}>
+                        {aiAnalysis.recommendations.map((rec, index) => (
+                          <li key={index}>{rec}</li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+                </div>
+              )}
               
               <div style={{ marginBottom: '0.5rem' }}>
                 <label style={{ display: 'block', marginBottom: '0.25rem' }}>Your Contact (optional):</label>
